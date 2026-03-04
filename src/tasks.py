@@ -3,6 +3,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -477,10 +478,69 @@ def _run_headless(command: list[str], env: dict[str, str], timeout_seconds: int)
         raise RuntimeError(f"analyzeHeadless timed out after {hard_timeout} seconds") from exc
 
 
-def _validate_required_artifacts(paths: list[str]) -> None:
+def _dir_debug_context(dir_path: Path) -> str:
+    """Return a diagnostic block describing a directory's ownership, permissions, and contents."""
+    lines = [f"  path:             {dir_path}"]
+    try:
+        st = dir_path.stat()
+        lines.append(f"  mode:             {stat.filemode(st.st_mode)}")
+        lines.append(f"  owner uid:gid:    {st.st_uid}:{st.st_gid}")
+    except OSError as exc:
+        lines.append(f"  stat failed:      {exc}")
+    try:
+        entries = sorted(p.name for p in dir_path.iterdir())
+        preview = entries[:20]
+        suffix = f" … (+{len(entries) - 20} more)" if len(entries) > 20 else ""
+        lines.append(f"  contents:         {preview}{suffix}")
+    except OSError as exc:
+        lines.append(f"  listing failed:   {exc}")
+    lines.append(f"  effective uid:gid: {os.getuid()}:{os.getgid()}")
+    return "\n".join(lines)
+
+
+def _check_output_dir_writable(output_path: str) -> None:
+    """Fail fast with a clear diagnostic if the output directory is missing or not writable."""
+    out_dir = Path(output_path)
+
+    if not out_dir.exists():
+        raise RuntimeError(
+            f"Output directory does not exist: {out_dir}\n"
+            + _dir_debug_context(out_dir.parent)
+        )
+
+    if not out_dir.is_dir():
+        raise RuntimeError(f"Output path is not a directory: {out_dir}")
+
+    probe = out_dir / ".openrelik_write_probe"
+    try:
+        probe.write_bytes(b"")
+        probe.unlink()
+    except OSError as exc:
+        try:
+            st = out_dir.stat()
+            mode_str = stat.filemode(st.st_mode)
+            owner = f"{st.st_uid}:{st.st_gid}"
+        except OSError:
+            mode_str = "unknown"
+            owner = "unknown"
+        raise RuntimeError(
+            f"Output directory is not writable by this process.\n"
+            f"  path:              {out_dir}\n"
+            f"  mode:              {mode_str}\n"
+            f"  owner uid:gid:     {owner}\n"
+            f"  effective uid:gid: {os.getuid()}:{os.getgid()}\n"
+            f"  error:             {exc}\n"
+            f"Fix: ensure the output directory is writable by uid {os.getuid()}."
+        ) from exc
+
+
+def _validate_required_artifacts(paths: list[str], output_path: str | None = None) -> None:
     missing_paths = [path for path in paths if not Path(path).exists()]
     if missing_paths:
-        raise RuntimeError(f"Missing expected output artifacts: {', '.join(missing_paths)}")
+        context = f"Missing expected output artifacts: {', '.join(missing_paths)}"
+        if output_path:
+            context += "\nOutput directory context:\n" + _dir_debug_context(Path(output_path))
+        raise RuntimeError(context)
 
 
 def _read_json_file(path: str) -> Any:
@@ -665,6 +725,8 @@ def command(
     config = _parse_analysis_config(task_config)
     subprocess_env = _build_subprocess_env(config)
 
+    _check_output_dir_writable(output_path)
+
     output_files = []
     command_strings = []
     samples_manifest = []
@@ -732,16 +794,21 @@ def command(
         if process.returncode != 0:
             stderr = (process.stderr or "").strip()
             stdout = (process.stdout or "").strip()
-            error_text = stderr or stdout or "No stderr/stdout captured"
+            parts = []
+            if stderr:
+                parts.append(f"stderr:\n{stderr}")
+            if stdout:
+                parts.append(f"stdout:\n{stdout}")
+            error_text = "\n".join(parts) if parts else "No stderr/stdout captured"
             raise RuntimeError(
-                f"analyzeHeadless failed for '{sample_path}' with code "
-                f"{process.returncode}: {error_text}"
+                f"analyzeHeadless failed for '{sample_path}' with exit code "
+                f"{process.returncode}:\n{error_text}"
             )
 
         expected_paths = [summary_output.path, functions_output.path, strings_output.path]
         if decompile_output:
             expected_paths.append(decompile_output.path)
-        _validate_required_artifacts(expected_paths)
+        _validate_required_artifacts(expected_paths, output_path=output_path)
 
         ai_summary_output = None
         if config.llm_config:
@@ -773,7 +840,7 @@ def command(
                     ai_summary_handle,
                     indent=2,
                 )
-            _validate_required_artifacts([ai_summary_output.path])
+            _validate_required_artifacts([ai_summary_output.path], output_path=output_path)
 
         output_files.extend([summary_output, functions_output, strings_output])
         if decompile_output:
