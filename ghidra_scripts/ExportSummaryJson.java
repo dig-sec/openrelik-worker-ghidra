@@ -1,6 +1,8 @@
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressIterator;
+import ghidra.program.model.data.StringDataInstance;
+import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.ExternalLocation;
@@ -76,10 +78,14 @@ public class ExportSummaryJson extends GhidraScript {
 
     private int countDefinedStrings(Program program) {
         int stringsCount = 0;
-        DefinedDataIterator iterator = DefinedDataIterator.definedStrings(program);
+        DefinedDataIterator iterator = DefinedDataIterator.definedData(program);
         while (iterator.hasNext()) {
-            iterator.next();
-            stringsCount += 1;
+            Data data = iterator.next();
+            // In Ghidra 12.x getStringDataInstance() never returns null; use isValid()
+            StringDataInstance instance = StringDataInstance.getStringDataInstance(data);
+            if (instance != null && instance.isValid() && instance.getStringValue() != null) {
+                stringsCount += 1;
+            }
         }
         return stringsCount;
     }

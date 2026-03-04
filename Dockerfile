@@ -43,9 +43,9 @@ RUN uv sync --no-dev
 
 RUN mkdir -p /opt/ghidra_scripts /openrelik/tmp /usr/share/openrelik/data \
     && cp -r /openrelik/ghidra_scripts/* /opt/ghidra_scripts/ \
-    && chmod -R 0555 /opt/ghidra_scripts \
+    && chmod -R 0755 /opt/ghidra_scripts \
     && chmod -R a+rX /opt/uv-python \
-    && chown -R openrelik:openrelik /openrelik /usr/share/openrelik /tmp
+    && chown -R openrelik:openrelik /openrelik /usr/share/openrelik /tmp /opt/ghidra_scripts
 
 ENV PATH="/openrelik/.venv/bin:$PATH"
 ENV GHIDRA_VERSION="${GHIDRA_VERSION}"

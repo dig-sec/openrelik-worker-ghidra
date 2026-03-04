@@ -35,17 +35,22 @@ public class ExportStringsJson extends GhidraScript {
         List<Map<String, Object>> strings = new ArrayList<>();
         ReferenceManager referenceManager = currentProgram.getReferenceManager();
 
-        DefinedDataIterator iterator = DefinedDataIterator.definedStrings(currentProgram);
+        DefinedDataIterator iterator = DefinedDataIterator.definedData(currentProgram);
         while (iterator.hasNext()) {
             Data data = iterator.next();
             StringDataInstance instance = StringDataInstance.getStringDataInstance(data);
-            if (instance == null) {
+            // In Ghidra 12.x getStringDataInstance() never returns null; use isValid()
+            if (instance == null || !instance.isValid()) {
+                continue;
+            }
+            String value = instance.getStringValue();
+            if (value == null) {
                 continue;
             }
 
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("address", data.getAddress().toString());
-            row.put("value", instance.getStringValue());
+            row.put("value", value);
             row.put("ref_count", referenceManager.getReferenceCountTo(data.getAddress()));
             strings.add(row);
         }
