@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import shlex
@@ -16,6 +17,8 @@ from openrelik_worker_common.file_utils import create_output_file
 from openrelik_worker_common.task_utils import create_task_result, get_input_files
 
 from .app import celery
+
+logger = logging.getLogger(__name__)
 
 TASK_NAME = "openrelik-worker-ghidra.tasks.analyze-headless"
 
@@ -466,7 +469,7 @@ def _build_headless_command(
 def _run_headless(command: list[str], env: dict[str, str], timeout_seconds: int) -> subprocess.CompletedProcess:
     hard_timeout = timeout_seconds + 120
     try:
-        return subprocess.run(
+        result = subprocess.run(
             command,
             capture_output=True,
             text=True,
@@ -474,6 +477,8 @@ def _run_headless(command: list[str], env: dict[str, str], timeout_seconds: int)
             timeout=hard_timeout,
             env=env,
         )
+        logger.info(f"analyzeHeadless exit code: {result.returncode}")
+        return result
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"analyzeHeadless timed out after {hard_timeout} seconds") from exc
 
@@ -496,6 +501,47 @@ def _dir_debug_context(dir_path: Path) -> str:
         lines.append(f"  listing failed:   {exc}")
     lines.append(f"  effective uid:gid: {os.getuid()}:{os.getgid()}")
     return "\n".join(lines)
+
+
+def _save_execution_log(output_path: str, label: str, content: str) -> Path:
+    """Save execution output (stdout/stderr) to a log file in the output directory."""
+    log_path = Path(output_path) / f"ghidra_execution_{label}.log"
+    try:
+        log_path.write_text(content, encoding="utf-8")
+        logger.info(f"Saved execution log: {log_path}")
+        return log_path
+    except OSError as exc:
+        logger.warning(f"Failed to save execution log {log_path}: {exc}")
+        return log_path
+
+
+def _check_artifact_files(artifact_paths: dict[str, str], sample_id: str) -> str:
+    """Check existence and size of generated artifact files. Return diagnostic summary."""
+    lines = [f"Artifact file status for {sample_id}:"]
+    for artifact_type, path_str in artifact_paths.items():
+        path = Path(path_str)
+        if path.exists():
+            size = path.stat().st_size
+            lines.append(f"  {artifact_type:20s}: EXISTS ({size} bytes) {path}")
+        else:
+            lines.append(f"  {artifact_type:20s}: MISSING {path}")
+    return "\n".join(lines)
+
+
+def _log_command_context(
+    command: list[str],
+    artifact_paths: dict[str, str],
+    project_directory: Path,
+    sample_id: str,
+) -> None:
+    """Log full command context for debugging."""
+    logger.info(f"\n=== Command execution context for {sample_id} ===")
+    logger.info(f"Command: {_shell_join(command)}")
+    logger.info(f"Project directory: {project_directory}")
+    logger.info(f"Expected output artifacts:")
+    for artifact_type, path_str in artifact_paths.items():
+        logger.info(f"  {artifact_type:20s}: {path_str}")
+    logger.info("===")
 
 
 def _check_output_dir_writable(output_path: str) -> None:
@@ -780,6 +826,16 @@ def command(
             decompile_path=decompile_output.path if decompile_output else None,
         )
         command_strings.append(_shell_join(command_line))
+        
+        # Log full command context before execution
+        artifact_map = {
+            "summary": summary_output.path,
+            "functions": functions_output.path,
+            "strings": strings_output.path,
+        }
+        if decompile_output:
+            artifact_map["decompile"] = decompile_output.path
+        _log_command_context(command_line, artifact_map, project_directory, sample_id)
 
         try:
             process = _run_headless(
@@ -791,9 +847,16 @@ def command(
             if not config.keep_project:
                 shutil.rmtree(project_directory, ignore_errors=True)
 
+        # Always save execution logs to output dir for debugging
+        stderr = (process.stderr or "").strip()
+        stdout = (process.stdout or "").strip()
+        
         if process.returncode != 0:
-            stderr = (process.stderr or "").strip()
-            stdout = (process.stdout or "").strip()
+            # Log execution output even on immediate failure
+            if stderr:
+                _save_execution_log(output_path, "stderr", stderr)
+            if stdout:
+                _save_execution_log(output_path, "stdout", stdout)
             parts = []
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
@@ -804,6 +867,24 @@ def command(
                 f"analyzeHeadless failed for '{sample_path}' with exit code "
                 f"{process.returncode}:\n{error_text}"
             )
+
+        # Check and log artifact existence after successful execution
+        artifact_paths = {
+            "summary": summary_output.path,
+            "functions": functions_output.path,
+            "strings": strings_output.path,
+        }
+        if decompile_output:
+            artifact_paths["decompile"] = decompile_output.path
+        
+        artifact_status = _check_artifact_files(artifact_paths, sample_id)
+        logger.info(artifact_status)
+        
+        # Save execution logs even on success for audit trail
+        if stdout:
+            _save_execution_log(output_path, "stdout", stdout)
+        if stderr:
+            _save_execution_log(output_path, "stderr_warnings", stderr)
 
         expected_paths = [summary_output.path, functions_output.path, strings_output.path]
         if decompile_output:
