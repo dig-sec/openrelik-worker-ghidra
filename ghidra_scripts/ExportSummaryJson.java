@@ -10,7 +10,7 @@ import ghidra.program.model.symbol.ExternalLocationIterator;
 import ghidra.program.model.symbol.ExternalManager;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolTable;
-import ghidra.program.util.DefinedDataIterator;
+import ghidra.program.util.DefinedStringIterator;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -76,14 +76,13 @@ public class ExportSummaryJson extends GhidraScript {
         println("Exported summary JSON: " + outputPathArg);
     }
 
+    // Ghidra 12+ compat: use DefinedStringIterator.forProgram() instead of
+    // the removed DefinedDataIterator.definedData() API.
     private int countDefinedStrings(Program program) {
         int stringsCount = 0;
-        DefinedDataIterator iterator = DefinedDataIterator.definedData(program);
-        while (iterator.hasNext()) {
-            Data data = iterator.next();
-            // In Ghidra 12.x getStringDataInstance() never returns null; use isValid()
+        for (Data data : DefinedStringIterator.forProgram(program, null)) {
             StringDataInstance instance = StringDataInstance.getStringDataInstance(data);
-            if (instance != null && instance.isValid() && instance.getStringValue() != null) {
+            if (instance != null && instance.getStringValue() != null) {
                 stringsCount += 1;
             }
         }

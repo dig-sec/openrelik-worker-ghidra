@@ -2,7 +2,7 @@ import ghidra.app.script.GhidraScript;
 import ghidra.program.model.data.StringDataInstance;
 import ghidra.program.model.listing.Data;
 import ghidra.program.model.symbol.ReferenceManager;
-import ghidra.program.util.DefinedDataIterator;
+import ghidra.program.util.DefinedStringIterator;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -35,12 +35,11 @@ public class ExportStringsJson extends GhidraScript {
         List<Map<String, Object>> strings = new ArrayList<>();
         ReferenceManager referenceManager = currentProgram.getReferenceManager();
 
-        DefinedDataIterator iterator = DefinedDataIterator.definedData(currentProgram);
-        while (iterator.hasNext()) {
-            Data data = iterator.next();
+        // Ghidra 12+ compat: use DefinedStringIterator.forProgram() instead of
+        // the removed DefinedDataIterator.definedData() API.
+        for (Data data : DefinedStringIterator.forProgram(currentProgram, currentSelection)) {
             StringDataInstance instance = StringDataInstance.getStringDataInstance(data);
-            // In Ghidra 12.x getStringDataInstance() never returns null; use isValid()
-            if (instance == null || !instance.isValid()) {
+            if (instance == null) {
                 continue;
             }
             String value = instance.getStringValue();
