@@ -1,0 +1,9 @@
+publish: true
+
+display_name: openrelik-worker-ghidra
+description: Secure headless Ghidra analysis worker for deterministic JSON artifacts.
+
+tools:
+  - display_name: Ghidra
+    description: Software reverse engineering suite for binary analysis and decompilation.
+    url: https://ghidra-sre.org/

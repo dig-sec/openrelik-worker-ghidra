@@ -1,0 +1,35 @@
+services:
+  openrelik-worker-ghidra:
+    image: ghcr.io/<you>/openrelik-worker-ghidra:latest
+    command:
+      [
+        "celery",
+        "--app=src.app",
+        "worker",
+        "--task-events",
+        "--concurrency=1",
+        "--loglevel=INFO",
+        "-Q",
+        "openrelik-worker-ghidra",
+      ]
+    user: "10001:10001"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:default
+      - apparmor:docker-default
+    cap_drop:
+      - ALL
+    network_mode: "none"
+    pids_limit: 256
+    mem_limit: 6g
+    cpus: "2.0"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=2g
+      - /openrelik/tmp:rw,noexec,nosuid,nodev,size=2g
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      # - OPENAI_API_KEY=replace-me
+      # - OPENAI_BASE_URL=https://api.openai.com/v1
+    volumes:
+      - ./data:/usr/share/openrelik/data:rw

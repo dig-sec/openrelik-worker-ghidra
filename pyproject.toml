@@ -1,0 +1,47 @@
+[project]
+name = "openrelik-worker-ghidra"
+version = "2026.03.04"
+description = "Secure headless Ghidra worker for OpenRelik"
+authors = [{ name = "OpenRelik", email = "openrelik@google.com" }]
+requires-python = ">=3.12,<4"
+readme = "README.md"
+dependencies = [
+    "celery[redis]>=5.4.0,<6",
+    "openrelik-worker-common>=0.17.1",
+    "debugpy>=1.8.7,<2",
+]
+
+[dependency-groups]
+test = [
+    "pytest>=8.3.5",
+]
+
+dev = [
+    "flake8>=7.0.0",
+    "isort>=5.13.2",
+    "black>=24.3.0",
+]
+
+[tool.uv]
+package = false
+default-groups = ["test"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.flake8]
+max-line-length = 100
+extend-ignore = ["E203", "W503"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+
+[tool.black]
+line-length = 100
+skip-string-normalization = false
