@@ -29,11 +29,12 @@ ARG OPENRELIK_PYDEBUG_PORT
 ENV OPENRELIK_PYDEBUG_PORT=${OPENRELIK_PYDEBUG_PORT:-5678}
 
 RUN groupadd --gid 10001 openrelik \
-    && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin openrelik
+    && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /tmp --shell /usr/sbin/nologin openrelik
 
 WORKDIR /openrelik
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+ENV UV_PYTHON_INSTALL_DIR="/opt/uv-python"
 COPY pyproject.toml ./
 RUN uv sync --no-install-project --no-dev
 
@@ -43,6 +44,7 @@ RUN uv sync --no-dev
 RUN mkdir -p /opt/ghidra_scripts /openrelik/tmp /usr/share/openrelik/data \
     && cp -r /openrelik/ghidra_scripts/* /opt/ghidra_scripts/ \
     && chmod -R 0555 /opt/ghidra_scripts \
+    && chmod -R a+rX /opt/uv-python \
     && chown -R openrelik:openrelik /openrelik /usr/share/openrelik /tmp
 
 ENV PATH="/openrelik/.venv/bin:$PATH"
