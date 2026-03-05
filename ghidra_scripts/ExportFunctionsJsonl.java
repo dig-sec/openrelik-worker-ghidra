@@ -1,4 +1,6 @@
 import ghidra.app.script.GhidraScript;
+import ghidra.program.model.data.StringDataInstance;
+import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.FunctionManager;
@@ -15,8 +17,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -63,14 +65,24 @@ public class ExportFunctionsJsonl extends GhidraScript {
                 row.put("entry_point", function.getEntryPoint().toString());
                 row.put("size", function.getBody().getNumAddresses());
                 row.put("signature", function.getPrototypeString(true, true));
-                row.put(
-                    "callers_count",
-                    countCallers(function, functionManager, referenceManager)
+
+                // Collect caller names
+                List<String> callerNames = collectCallerNames(
+                    function, functionManager, referenceManager
                 );
-                row.put(
-                    "callees_count",
-                    countCallees(function, functionManager, referenceManager, listing)
+                row.put("callers_count", callerNames.size());
+                row.put("callers", callerNames);
+
+                // Single-pass collection of callees, imported calls, and string refs
+                Map<String, Object> callInfo = collectCallAndDataInfo(
+                    function, functionManager, referenceManager, listing
                 );
+                @SuppressWarnings("unchecked")
+                List<String> calleeNames = (List<String>) callInfo.get("callees");
+                row.put("callees_count", calleeNames != null ? calleeNames.size() : 0);
+                row.put("callees", callInfo.get("callees"));
+                row.put("imported_calls", callInfo.get("imported_calls"));
+                row.put("string_refs", callInfo.get("string_refs"));
 
                 writer.write(toJson(row));
                 writer.newLine();
@@ -80,57 +92,92 @@ public class ExportFunctionsJsonl extends GhidraScript {
         println("Exported functions JSONL: " + outputPath);
     }
 
-    private int countCallers(
+    private List<String> collectCallerNames(
         Function function,
         FunctionManager functionManager,
         ReferenceManager referenceManager
     ) {
-        Set<String> callerEntryPoints = new HashSet<>();
-
+        Set<String> seen = new LinkedHashSet<>();
         ReferenceIterator references = referenceManager.getReferencesTo(function.getEntryPoint());
         while (references.hasNext()) {
             Reference reference = references.next();
             if (!reference.getReferenceType().isCall()) {
                 continue;
             }
-
             Function caller = functionManager.getFunctionContaining(reference.getFromAddress());
-            if (caller != null) {
-                callerEntryPoints.add(caller.getEntryPoint().toString());
+            if (caller != null && !caller.getEntryPoint().equals(function.getEntryPoint())) {
+                seen.add(caller.getName());
             }
         }
-
-        return callerEntryPoints.size();
+        return new ArrayList<>(seen);
     }
 
-    private int countCallees(
+    /**
+     * Single pass over a function's instructions to collect:
+     * - callee function names
+     * - imported/external API calls (resolved through thunks)
+     * - referenced string literal values
+     */
+    private Map<String, Object> collectCallAndDataInfo(
         Function function,
         FunctionManager functionManager,
         ReferenceManager referenceManager,
         Listing listing
     ) {
-        Set<String> calleeEntryPoints = new HashSet<>();
+        Set<String> calleeNames = new LinkedHashSet<>();
+        Set<String> importedCalls = new LinkedHashSet<>();
+        Set<String> stringRefs = new LinkedHashSet<>();
 
         InstructionIterator instructions = listing.getInstructions(function.getBody(), true);
         while (instructions.hasNext()) {
             Instruction instruction = instructions.next();
             Reference[] references = referenceManager.getReferencesFrom(instruction.getAddress());
-            for (Reference reference : references) {
-                if (!reference.getReferenceType().isCall()) {
-                    continue;
-                }
 
-                Function callee = functionManager.getFunctionAt(reference.getToAddress());
-                if (callee == null) {
-                    callee = functionManager.getFunctionContaining(reference.getToAddress());
-                }
-                if (callee != null) {
-                    calleeEntryPoints.add(callee.getEntryPoint().toString());
+            for (Reference reference : references) {
+                if (reference.getReferenceType().isCall()) {
+                    Function callee = functionManager.getFunctionAt(reference.getToAddress());
+                    if (callee == null) {
+                        callee = functionManager.getFunctionContaining(reference.getToAddress());
+                    }
+                    if (callee != null) {
+                        calleeNames.add(callee.getName());
+
+                        // Resolve thunks to find the actual external/imported function
+                        Function resolved = callee;
+                        while (resolved.isThunk()) {
+                            Function thunked = resolved.getThunkedFunction(false);
+                            if (thunked == null) {
+                                break;
+                            }
+                            resolved = thunked;
+                        }
+                        if (resolved.isExternal()) {
+                            importedCalls.add(resolved.getName(true));
+                        }
+                    }
+                } else {
+                    // Non-call reference: check if target is a defined string
+                    Data data = listing.getDefinedDataAt(reference.getToAddress());
+                    if (data != null) {
+                        StringDataInstance instance =
+                            StringDataInstance.getStringDataInstance(data);
+                        if (instance != null) {
+                            String value = instance.getStringValue();
+                            if (value != null && !value.isEmpty()
+                                    && stringRefs.size() < 20) {
+                                stringRefs.add(value);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        return calleeEntryPoints.size();
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("callees", new ArrayList<>(calleeNames));
+        result.put("imported_calls", new ArrayList<>(importedCalls));
+        result.put("string_refs", new ArrayList<>(stringRefs));
+        return result;
     }
 
     private String toJson(Object value) {

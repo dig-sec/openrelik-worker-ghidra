@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -25,21 +26,22 @@ TASK_NAME = "openrelik-worker-ghidra.tasks.analyze-headless"
 DEFAULT_TIMEOUT_SECONDS = 600
 MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 1800
-DEFAULT_DECOMPILE_MODE = "entrypoints"
+DEFAULT_DECOMPILE_MODE = "focused"
 DEFAULT_EXPORT_FORMAT = "json"
 DEFAULT_MAX_MEMORY = "4G"
 DEFAULT_ANALYZE_HEADLESS = "/opt/ghidra/support/analyzeHeadless"
 DEFAULT_SCRIPT_PATH = "/opt/ghidra_scripts"
 DEFAULT_ACTIVE_PROCESSORS = 2
+DEFAULT_FOCUSED_DECOMPILE_LIMIT = 80
 
 DEFAULT_LLM_PROVIDER = "none"
 DEFAULT_OLLAMA_URL = "http://ollama:11434"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_LLM_TIMEOUT_SECONDS = 45
-DEFAULT_LLM_MAX_TOKENS = 512
+DEFAULT_LLM_MAX_TOKENS = 4096
 DEFAULT_LLM_TEMPERATURE = 0.0
 
-ALLOWED_DECOMPILE_MODES = {"off", "entrypoints", "all"}
+ALLOWED_DECOMPILE_MODES = {"off", "entrypoints", "focused", "all"}
 ALLOWED_EXPORT_FORMATS = {"json", "json+decompile"}
 ALLOWED_LLM_PROVIDERS = {"none", "ollama", "openai"}
 
@@ -47,6 +49,21 @@ LLM_SYSTEM_PROMPT = (
     "You are an incident response reverse engineering assistant. "
     "Respond with valid JSON only using keys: overview, capabilities, iocs, "
     "notable_functions, notable_strings, confidence."
+)
+
+LLM_ANNOTATION_SYSTEM_PROMPT = (
+    "You are an expert reverse engineer analyzing decompiled binary functions. "
+    "For each function provided, determine its likely purpose and suggest a "
+    "meaningful name. Respond with a JSON array. Each element must have:\n"
+    "- name: the current function name (exactly as given)\n"
+    "- likely_name: a descriptive snake_case name (e.g. 'establish_c2_connection', "
+    "'decrypt_config_buffer', 'get_socket_connection')\n"
+    "- purpose: 1-2 sentence description of what the function does\n"
+    "- confidence: 'high', 'medium', or 'low'\n"
+    "- evidence: array of strings citing specific clues (API calls, strings, "
+    "call patterns, parameter types)\n"
+    "Only include functions where you can determine purpose with at least low "
+    "confidence. Respond with valid JSON only — no markdown, no explanation."
 )
 
 TASK_METADATA = {
@@ -67,7 +84,10 @@ TASK_METADATA = {
         {
             "name": "decompile_mode",
             "label": "Decompile scope",
-            "description": "off | entrypoints | all. Default entrypoints.",
+            "description": (
+                "off | entrypoints | focused | all. Default focused. "
+                "focused = entrypoints + top-80 functions by significance."
+            ),
             "type": "text",
             "required": True,
             "default_value": DEFAULT_DECOMPILE_MODE,
@@ -179,6 +199,7 @@ class AnalysisConfig:
     ghidra_version: str
     scripts_git_sha: str
     active_processors: int
+    focused_decompile_limit: int
     llm_config: LLMConfig | None
 
 
@@ -384,6 +405,13 @@ def _parse_analysis_config(task_config: dict[str, Any]) -> AnalysisConfig:
         ghidra_version=os.getenv("GHIDRA_VERSION", "unknown"),
         scripts_git_sha=os.getenv("GHIDRA_SCRIPTS_GIT_SHA", "unknown"),
         active_processors=_parse_active_processors(os.getenv("GHIDRA_ACTIVE_PROCESSORS")),
+        focused_decompile_limit=_parse_bounded_int(
+            task_config.get("focused_decompile_limit"),
+            default=DEFAULT_FOCUSED_DECOMPILE_LIMIT,
+            minimum=10,
+            maximum=500,
+            field_name="task_config.focused_decompile_limit",
+        ),
         llm_config=_parse_llm_config(task_config),
     )
 
@@ -450,12 +478,16 @@ def _build_headless_command(
     if config.include_decompile:
         if not decompile_path:
             raise RuntimeError("decompile output path is required when include_decompile is true")
+        # For focused mode, pass "focused:80" so the Ghidra script knows the limit
+        ghidra_decompile_mode = config.decompile_mode
+        if ghidra_decompile_mode == "focused":
+            ghidra_decompile_mode = f"focused:{config.focused_decompile_limit}"
         command.extend(
             [
                 "-postScript",
                 "ExportDecompileJsonl.java",
                 decompile_path,
-                config.decompile_mode,
+                ghidra_decompile_mode,
                 str(config.timeout_seconds),
             ]
         )
@@ -610,6 +642,39 @@ def _read_jsonl_preview(path: str, limit: int) -> list[Any]:
     return records
 
 
+def _read_all_jsonl(path: str) -> list[Any]:
+    """Read all records from a JSONL file."""
+    records = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+def _score_function(func: dict[str, Any]) -> float:
+    """Score a function by significance for LLM analysis.
+
+    Higher score = more interesting for reverse-engineering.
+    Considers code size, caller count, imported API usage, and string references.
+    """
+    size = max(func.get("size", 0), 1)
+    callers = func.get("callers_count", len(func.get("callers", [])))
+    imported = len(func.get("imported_calls", []))
+    strings = len(func.get("string_refs", []))
+    return size * (1 + callers) * (1 + imported * 2) * (1 + strings)
+
+
+def _rank_functions(functions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rank functions by significance score, highest first."""
+    return sorted(functions, key=_score_function, reverse=True)
+
+
 def _build_llm_payload(
     summary_path: str,
     functions_path: str,
@@ -619,20 +684,45 @@ def _build_llm_payload(
     summary = _read_json_file(summary_path)
     strings_data = _read_json_file(strings_path)
 
-    strings_preview = []
+    # Rank strings by ref_count (most-referenced = most interesting)
+    raw_strings: list[Any] = []
     if isinstance(strings_data, dict):
-        raw_strings = strings_data.get("strings")
-        if isinstance(raw_strings, list):
-            strings_preview = raw_strings[:40]
+        raw = strings_data.get("strings")
+        if isinstance(raw, list):
+            raw_strings = raw
+    ranked_strings = sorted(
+        raw_strings, key=lambda s: s.get("ref_count", 0) if isinstance(s, dict) else 0, reverse=True
+    )
 
-    payload = {
+    # Rank functions by significance score
+    all_functions = _read_all_jsonl(functions_path)
+    ranked_functions = _rank_functions(all_functions)
+
+    payload: dict[str, Any] = {
         "summary": summary,
-        "functions_preview": _read_jsonl_preview(functions_path, limit=40),
-        "strings_preview": strings_preview,
+        "functions_preview": ranked_functions[:80],
+        "strings_preview": ranked_strings[:60],
     }
 
     if decompile_path and Path(decompile_path).exists():
-        payload["decompile_preview"] = _read_jsonl_preview(decompile_path, limit=8)
+        all_decompile = _read_all_jsonl(decompile_path)
+        # Match decompile records to ranked functions for best coverage
+        decompile_by_ep = {
+            r.get("entry_point"): r
+            for r in all_decompile
+            if isinstance(r, dict) and r.get("status") == "ok"
+        }
+        ranked_decompile: list[Any] = []
+        for func in ranked_functions:
+            ep = func.get("entry_point")
+            if ep in decompile_by_ep:
+                ranked_decompile.append(decompile_by_ep[ep])
+        # Also include any decompiled functions not in the ranked list
+        seen_eps = {r.get("entry_point") for r in ranked_decompile}
+        for r in all_decompile:
+            if r.get("entry_point") not in seen_eps and r.get("status") == "ok":
+                ranked_decompile.append(r)
+        payload["decompile_preview"] = ranked_decompile[:30]
 
     return payload
 
@@ -710,7 +800,11 @@ def _generate_llm_summary(llm_config: LLMConfig, payload: dict[str, Any]) -> str
         "Artifacts JSON:\n"
         + json.dumps(payload, sort_keys=True)
     )
+    return _call_llm(llm_config, LLM_SYSTEM_PROMPT, user_message)
 
+
+def _call_llm(llm_config: LLMConfig, system_prompt: str, user_message: str) -> str:
+    """Send a chat message to the configured LLM and return the response content."""
     if llm_config.provider == "ollama":
         url = llm_config.endpoint.rstrip("/") + "/api/chat"
         response = _http_json_post(
@@ -720,7 +814,7 @@ def _generate_llm_summary(llm_config: LLMConfig, payload: dict[str, Any]) -> str
                 "model": llm_config.model,
                 "stream": False,
                 "messages": [
-                    {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message},
                 ],
                 "options": {
@@ -743,12 +837,215 @@ def _generate_llm_summary(llm_config: LLMConfig, payload: dict[str, Any]) -> str
             "temperature": llm_config.temperature,
             "max_tokens": llm_config.max_tokens,
             "messages": [
-                {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
         },
     )
     return _extract_openai_content(response)
+
+
+def _parse_annotation_response(raw: str) -> list[dict[str, Any]]:
+    """Parse and validate the LLM annotation response JSON.
+
+    Tolerates markdown fences and minor format issues. Returns only
+    well-formed annotation dicts with required fields.
+    """
+    cleaned = raw.strip()
+
+    # Strip markdown code fences if present
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        start = 1 if lines[0].startswith("```") else 0
+        end = len(lines) - 1 if lines[-1].strip() == "```" else len(lines)
+        cleaned = "\n".join(lines[start:end]).strip()
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        logger.warning("LLM annotation response was not valid JSON, returning empty annotations")
+        return []
+
+    # Accept { "annotations": [...] } wrapper or bare array
+    if isinstance(parsed, dict) and "annotations" in parsed:
+        parsed = parsed["annotations"]
+
+    if not isinstance(parsed, list):
+        logger.warning("LLM annotation response was not a JSON array")
+        return []
+
+    required_keys = {"name", "likely_name", "purpose", "confidence"}
+    valid_confidence = {"high", "medium", "low"}
+
+    validated: list[dict[str, Any]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        if not required_keys.issubset(item.keys()):
+            continue
+        conf = item.get("confidence")
+        if conf not in valid_confidence:
+            conf = "low"
+        evidence = item.get("evidence")
+        if not isinstance(evidence, list):
+            evidence = []
+        validated.append({
+            "name": str(item["name"]),
+            "likely_name": str(item["likely_name"]),
+            "purpose": str(item["purpose"]),
+            "confidence": conf,
+            "evidence": [str(e) for e in evidence],
+        })
+
+    return validated
+
+
+def _build_annotation_chunks(
+    functions_path: str,
+    decompile_path: str,
+    summary_path: str,
+    max_functions_per_chunk: int = 15,
+) -> list[dict[str, Any]]:
+    """Build chunks of decompiled functions with enriched context for LLM annotation.
+
+    Each chunk contains binary context plus up to max_functions_per_chunk
+    decompiled functions with their metadata (callers, callees, imports, strings).
+    Functions are ordered by significance score (most interesting first).
+    """
+    summary = _read_json_file(summary_path)
+    all_functions = _read_all_jsonl(functions_path)
+    func_by_ep: dict[str, dict[str, Any]] = {
+        f["entry_point"]: f for f in all_functions if isinstance(f, dict) and "entry_point" in f
+    }
+
+    all_decompile = _read_all_jsonl(decompile_path)
+    ok_decompile = [
+        r for r in all_decompile
+        if isinstance(r, dict) and r.get("status") == "ok" and r.get("decompile")
+    ]
+
+    # Rank by function significance
+    def get_score(dec_record: dict[str, Any]) -> float:
+        func_info = func_by_ep.get(dec_record.get("entry_point", ""), {})
+        return _score_function(func_info)
+
+    ok_decompile.sort(key=get_score, reverse=True)
+
+    binary_context = {
+        "program_name": summary.get("program_name", ""),
+        "language_id": summary.get("language_id", ""),
+        "imports": summary.get("imports", []),
+    }
+
+    chunks: list[dict[str, Any]] = []
+    current_chunk: list[dict[str, Any]] = []
+
+    for dec in ok_decompile:
+        ep = dec.get("entry_point", "")
+        func_info = func_by_ep.get(ep, {})
+
+        enriched = {
+            "name": dec.get("name", ""),
+            "entry_point": ep,
+            "signature": dec.get("signature", func_info.get("signature", "")),
+            "size": func_info.get("size", 0),
+            "callers": func_info.get("callers", []),
+            "callees": func_info.get("callees", []),
+            "imported_calls": func_info.get("imported_calls", []),
+            "string_refs": func_info.get("string_refs", []),
+            "decompile": dec.get("decompile", ""),
+        }
+
+        current_chunk.append(enriched)
+
+        if len(current_chunk) >= max_functions_per_chunk:
+            chunks.append({
+                "binary_context": binary_context,
+                "functions": list(current_chunk),
+            })
+            current_chunk = []
+
+    if current_chunk:
+        chunks.append({
+            "binary_context": binary_context,
+            "functions": list(current_chunk),
+        })
+
+    return chunks
+
+
+def _generate_function_annotations(
+    llm_config: LLMConfig,
+    functions_path: str,
+    decompile_path: str,
+    summary_path: str,
+) -> list[dict[str, Any]]:
+    """Generate per-function annotations using LLM.
+
+    Sends decompiled functions in chunks to the LLM, asking it to identify
+    each function's purpose and suggest a meaningful name (the 'aha' moment).
+    Returns a list of annotation dicts.
+    """
+    chunks = _build_annotation_chunks(functions_path, decompile_path, summary_path)
+    if not chunks:
+        logger.info("No decompiled functions available for annotation")
+        return []
+
+    all_annotations: list[dict[str, Any]] = []
+
+    for chunk_index, chunk in enumerate(chunks):
+        user_message = (
+            "Analyze each decompiled function below and identify its purpose. "
+            "For each function, suggest a meaningful name based on its behavior. "
+            "Binary context and functions to analyze:\n"
+            + json.dumps(chunk, sort_keys=True)
+        )
+
+        try:
+            raw_response = _call_llm(
+                llm_config, LLM_ANNOTATION_SYSTEM_PROMPT, user_message
+            )
+            annotations = _parse_annotation_response(raw_response)
+            all_annotations.extend(annotations)
+            logger.info(
+                f"Annotation chunk {chunk_index + 1}/{len(chunks)}: "
+                f"{len(annotations)} annotations from {len(chunk['functions'])} functions"
+            )
+        except RuntimeError as exc:
+            logger.warning(
+                f"Annotation chunk {chunk_index + 1}/{len(chunks)} failed: {exc}"
+            )
+            continue
+
+    return all_annotations
+
+
+def _validate_llm_json(raw: str) -> dict[str, Any] | None:
+    """Parse the LLM summary response and validate it has the expected structure.
+
+    Returns the parsed dict if valid, or None if unparseable.
+    Tolerates markdown fences around JSON.
+    """
+    cleaned = raw.strip()
+
+    # Strip markdown code fences
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        start = 1 if lines[0].startswith("```") else 0
+        end = len(lines) - 1 if lines[-1].strip() == "```" else len(lines)
+        cleaned = "\n".join(lines[start:end]).strip()
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        logger.warning("LLM summary response was not valid JSON")
+        return None
+
+    if not isinstance(parsed, dict):
+        logger.warning("LLM summary response is not a JSON object")
+        return None
+
+    return parsed
 
 
 @celery.task(bind=True, name=TASK_NAME, metadata=TASK_METADATA)
@@ -892,6 +1189,7 @@ def command(
         _validate_required_artifacts(expected_paths, output_path=output_path)
 
         ai_summary_output = None
+        ai_annotations_output = None
         if config.llm_config:
             ai_summary_output = create_output_file(
                 output_path,
@@ -904,13 +1202,19 @@ def command(
                 strings_path=strings_output.path,
                 decompile_path=decompile_output.path if decompile_output else None,
             )
-            llm_summary = _generate_llm_summary(config.llm_config, llm_payload)
+            llm_summary_raw = _generate_llm_summary(config.llm_config, llm_payload)
+
+            # Validate LLM JSON; store parsed version if valid, raw otherwise
+            llm_parsed = _validate_llm_json(llm_summary_raw)
+            summary_content = llm_parsed if llm_parsed is not None else llm_summary_raw
+
             with open(ai_summary_output.path, "w", encoding="utf-8") as ai_summary_handle:
                 json.dump(
                     {
                         "provider": config.llm_config.provider,
                         "model": config.llm_config.model,
-                        "summary": llm_summary,
+                        "summary": summary_content,
+                        "summary_valid_json": llm_parsed is not None,
                         "source_files": {
                             "summary": summary_output.display_name,
                             "functions": functions_output.display_name,
@@ -923,11 +1227,38 @@ def command(
                 )
             _validate_required_artifacts([ai_summary_output.path], output_path=output_path)
 
+            # Per-function annotations (requires decompile output)
+            if decompile_output:
+                ai_annotations_output = create_output_file(
+                    output_path,
+                    display_name=f"{sample_id}.ai-annotations.jsonl",
+                    data_type="openrelik:ghidra:ai-annotations",
+                )
+                try:
+                    annotations = _generate_function_annotations(
+                        llm_config=config.llm_config,
+                        functions_path=functions_output.path,
+                        decompile_path=decompile_output.path,
+                        summary_path=summary_output.path,
+                    )
+                    with open(ai_annotations_output.path, "w", encoding="utf-8") as ann_handle:
+                        for annotation in annotations:
+                            ann_handle.write(json.dumps(annotation) + "\n")
+                    logger.info(
+                        f"Wrote {len(annotations)} function annotations for {sample_id}"
+                    )
+                except Exception as exc:
+                    logger.warning(f"Function annotation failed for {sample_id}: {exc}")
+                    # Write empty file so artifact is still registered
+                    Path(ai_annotations_output.path).write_text("", encoding="utf-8")
+
         output_files.extend([summary_output, functions_output, strings_output])
         if decompile_output:
             output_files.append(decompile_output)
         if ai_summary_output:
             output_files.append(ai_summary_output)
+        if ai_annotations_output:
+            output_files.append(ai_annotations_output)
 
         sample_manifest = {
             "sample_id": sample_id,
@@ -943,6 +1274,8 @@ def command(
             sample_manifest["decompile"] = decompile_output.display_name
         if ai_summary_output:
             sample_manifest["ai_summary"] = ai_summary_output.display_name
+        if ai_annotations_output:
+            sample_manifest["ai_annotations"] = ai_annotations_output.display_name
         samples_manifest.append(sample_manifest)
 
         self.send_event(

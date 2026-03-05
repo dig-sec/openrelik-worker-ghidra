@@ -27,11 +27,12 @@ def test_parse_analysis_config_defaults(monkeypatch):
     config = tasks._parse_analysis_config({})
 
     assert config.timeout_seconds == 600
-    assert config.decompile_mode == "entrypoints"
+    assert config.decompile_mode == "focused"
     assert config.export_format == "json"
     assert config.include_decompile is False
     assert config.keep_project is False
     assert config.max_memory == "4G"
+    assert config.focused_decompile_limit == 80
     assert config.llm_config is None
 
 
@@ -92,6 +93,7 @@ def test_build_headless_command_includes_expected_flags(tmp_path):
         ghidra_version="11.2.1",
         scripts_git_sha="deadbeef",
         active_processors=2,
+        focused_decompile_limit=80,
         llm_config=None,
     )
 
@@ -576,6 +578,10 @@ class TestBuildLLMPayload:
                 "signature": "int entry(void)",
                 "callers_count": 0,
                 "callees_count": 5,
+                "callers": [],
+                "callees": ["FUN_00401100", "FUN_00401300"],
+                "imported_calls": [],
+                "string_refs": [],
             },
             {
                 "name": "FUN_00401100",
@@ -584,6 +590,10 @@ class TestBuildLLMPayload:
                 "signature": "void FUN_00401100(char * param_1, int param_2)",
                 "callers_count": 1,
                 "callees_count": 3,
+                "callers": ["entry"],
+                "callees": ["connect", "socket", "send"],
+                "imported_calls": ["ws2_32.dll::connect", "ws2_32.dll::socket", "ws2_32.dll::send"],
+                "string_refs": ["http://evil.example.com/c2"],
             },
             {
                 "name": "FUN_00401300",
@@ -592,6 +602,10 @@ class TestBuildLLMPayload:
                 "signature": "int FUN_00401300(void)",
                 "callers_count": 2,
                 "callees_count": 1,
+                "callers": ["entry", "FUN_00401100"],
+                "callees": ["CreateFileA"],
+                "imported_calls": ["KERNEL32.DLL::CreateFileA"],
+                "string_refs": [],
             },
         ]
         functions_path.write_text(
@@ -673,13 +687,14 @@ class TestBuildLLMPayload:
         assert s["function_count"] == 42
 
     def test_payload_functions_preview_populated(self, tmp_path):
-        """Functions preview must contain function records."""
+        """Functions preview must contain function records ranked by significance."""
         summary, functions, strings, decompile = self._write_artifacts(tmp_path)
         payload = tasks._build_llm_payload(summary, functions, strings, decompile)
 
         funcs = payload["functions_preview"]
         assert len(funcs) == 3
-        assert funcs[0]["name"] == "entry"
+        # FUN_00401100 should rank highest (large, has imports + strings)
+        assert funcs[0]["name"] == "FUN_00401100"
         assert "signature" in funcs[0]
 
     def test_payload_strings_preview_populated(self, tmp_path):
@@ -698,9 +713,13 @@ class TestBuildLLMPayload:
 
         decomps = payload["decompile_preview"]
         assert len(decomps) == 2
+        # Both decompiled functions should be present
+        all_code = " ".join(d["decompile"] for d in decomps)
+        assert "connect" in all_code
+        assert "socket" in all_code
+        # FUN_00401100 should rank first (has imports + strings)
+        assert decomps[0]["name"] == "FUN_00401100"
         assert decomps[0]["status"] == "ok"
-        assert "connect" in decomps[1]["decompile"]
-        assert "socket" in decomps[1]["decompile"]
 
     def test_payload_without_decompile(self, tmp_path):
         """When decompile_path is None, payload should still be valid."""
@@ -713,7 +732,7 @@ class TestBuildLLMPayload:
         assert "decompile_preview" not in payload
 
     def test_payload_respects_function_limit(self, tmp_path):
-        """Functions preview is capped at 40 entries."""
+        """Functions preview is capped at 80 entries."""
         summary_path, _, strings_path, _ = self._write_artifacts(tmp_path)
 
         big_functions = tmp_path / "big_functions.jsonl"
@@ -723,18 +742,18 @@ class TestBuildLLMPayload:
         big_functions.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         payload = tasks._build_llm_payload(summary_path, str(big_functions), strings_path, None)
-        assert len(payload["functions_preview"]) == 40
+        assert len(payload["functions_preview"]) == 80
 
     def test_payload_respects_decompile_limit(self, tmp_path):
-        """Decompile preview is capped at 8 entries."""
+        """Decompile preview is capped at 30 entries."""
         summary_path, functions_path, strings_path, _ = self._write_artifacts(tmp_path)
 
         big_decompile = tmp_path / "big_decompile.jsonl"
         lines = []
-        for i in range(20):
+        for i in range(50):
             lines.append(
                 json.dumps(
-                    {"name": f"FUN_{i}", "status": "ok", "decompile": f"void FUN_{i}() {{}}"}
+                    {"name": f"FUN_{i}", "entry_point": f"0x{i:08x}", "status": "ok", "decompile": f"void FUN_{i}() {{}}"}
                 )
             )
         big_decompile.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -742,7 +761,7 @@ class TestBuildLLMPayload:
         payload = tasks._build_llm_payload(
             summary_path, functions_path, strings_path, str(big_decompile)
         )
-        assert len(payload["decompile_preview"]) == 8
+        assert len(payload["decompile_preview"]) == 30
 
 
 # ---------------------------------------------------------------------------
@@ -921,9 +940,21 @@ def test_command_with_decompile_and_llm_produces_complete_output(monkeypatch, tm
         assert len(payload["decompile_preview"]) > 0
         return llm_response
 
+    def fake_generate_annotations(llm_config, functions_path, decompile_path, summary_path):
+        return [
+            {
+                "name": "main",
+                "likely_name": "establish_c2_connection",
+                "purpose": "Connects to remote C2 server.",
+                "confidence": "high",
+                "evidence": ["calls connect()"],
+            }
+        ]
+
     monkeypatch.setattr("src.tasks.create_output_file", fake_create_output_file)
     monkeypatch.setattr("src.tasks.subprocess.run", fake_subprocess_run_realistic)
     monkeypatch.setattr("src.tasks._generate_llm_summary", fake_generate_llm)
+    monkeypatch.setattr("src.tasks._generate_function_annotations", fake_generate_annotations)
     monkeypatch.setattr(tasks.command, "send_event", lambda *args, **kwargs: None)
 
     result = tasks.command.run(
@@ -950,9 +981,11 @@ def test_command_with_decompile_and_llm_produces_complete_output(monkeypatch, tm
     ai_summary = json.loads(ai_files[0].read_text(encoding="utf-8"))
     assert ai_summary["provider"] == "ollama"
     assert ai_summary["model"] == "llama3.1:8b-instruct"
+    assert ai_summary["summary_valid_json"] is True
 
-    # The summary field should contain the structured LLM output
-    parsed_summary = json.loads(ai_summary["summary"])
+    # The summary field is now stored as a parsed dict (validated JSON)
+    parsed_summary = ai_summary["summary"]
+    assert isinstance(parsed_summary, dict)
     assert "overview" in parsed_summary
     assert "capabilities" in parsed_summary
     assert "iocs" in parsed_summary
@@ -963,11 +996,324 @@ def test_command_with_decompile_and_llm_produces_complete_output(monkeypatch, tm
     decompile_files = list(output_dir.glob("*.decompile.jsonl"))
     assert decompile_files, "Decompile file must be created"
 
+    # Verify annotations artifact exists
+    annotation_files = list(output_dir.glob("*.ai-annotations.jsonl"))
+    assert annotation_files, "AI annotations file must be created"
+    ann_content = annotation_files[0].read_text(encoding="utf-8").strip()
+    annotations = [json.loads(line) for line in ann_content.split("\n") if line.strip()]
+    assert len(annotations) == 1
+    assert annotations[0]["likely_name"] == "establish_c2_connection"
+    assert annotations[0]["confidence"] == "high"
+
     # Verify manifest references all artifacts
     manifest = json.loads((output_dir / "ghidra_manifest.json").read_text(encoding="utf-8"))
     sample = manifest["samples"][0]
     assert "decompile" in sample
     assert "ai_summary" in sample
+    assert "ai_annotations" in sample
     assert manifest["llm"]["provider"] == "ollama"
     assert manifest["decompile_mode"] == "entrypoints"
     assert manifest["export_format"] == "json+decompile"
+
+
+# ---------------------------------------------------------------------------
+# _score_function — significance ranking
+# ---------------------------------------------------------------------------
+
+
+class TestScoreFunction:
+    """Validate function significance scoring."""
+
+    def test_function_with_imports_and_strings_scores_highest(self):
+        """Functions with imported API calls and string refs should rank highest."""
+        plain = {"size": 100, "callers_count": 1, "imported_calls": [], "string_refs": []}
+        has_imports = {"size": 100, "callers_count": 1, "imported_calls": ["connect"], "string_refs": []}
+        has_both = {
+            "size": 100, "callers_count": 1,
+            "imported_calls": ["connect", "socket"],
+            "string_refs": ["http://evil.com"],
+        }
+
+        assert tasks._score_function(has_imports) > tasks._score_function(plain)
+        assert tasks._score_function(has_both) > tasks._score_function(has_imports)
+
+    def test_larger_functions_score_higher(self):
+        small = {"size": 10, "callers_count": 0, "imported_calls": [], "string_refs": []}
+        large = {"size": 500, "callers_count": 0, "imported_calls": [], "string_refs": []}
+        assert tasks._score_function(large) > tasks._score_function(small)
+
+    def test_more_callers_score_higher(self):
+        few = {"size": 100, "callers_count": 1, "imported_calls": [], "string_refs": []}
+        many = {"size": 100, "callers_count": 10, "imported_calls": [], "string_refs": []}
+        assert tasks._score_function(many) > tasks._score_function(few)
+
+    def test_empty_function_has_nonzero_score(self):
+        minimal = {}
+        assert tasks._score_function(minimal) >= 1
+
+
+class TestRankFunctions:
+    """Validate function ranking order."""
+
+    def test_ranks_by_score_descending(self):
+        functions = [
+            {"name": "small", "size": 10},
+            {"name": "large_with_imports", "size": 500, "imported_calls": ["connect"]},
+            {"name": "medium", "size": 200},
+        ]
+        ranked = tasks._rank_functions(functions)
+        assert ranked[0]["name"] == "large_with_imports"
+        assert ranked[-1]["name"] == "small"
+
+
+# ---------------------------------------------------------------------------
+# _parse_annotation_response — LLM annotation validation
+# ---------------------------------------------------------------------------
+
+
+class TestParseAnnotationResponse:
+    """Validate parsing and validation of LLM annotation JSON."""
+
+    def test_valid_json_array(self):
+        raw = json.dumps([
+            {
+                "name": "FUN_001",
+                "likely_name": "get_socket_connection",
+                "purpose": "Creates a TCP socket and connects to a server.",
+                "confidence": "high",
+                "evidence": ["calls socket()", "calls connect()"],
+            }
+        ])
+        result = tasks._parse_annotation_response(raw)
+        assert len(result) == 1
+        assert result[0]["likely_name"] == "get_socket_connection"
+        assert result[0]["confidence"] == "high"
+        assert len(result[0]["evidence"]) == 2
+
+    def test_wrapped_in_annotations_key(self):
+        raw = json.dumps({"annotations": [
+            {
+                "name": "FUN_002",
+                "likely_name": "decrypt_config",
+                "purpose": "Decrypts configuration data.",
+                "confidence": "medium",
+                "evidence": [],
+            }
+        ]})
+        result = tasks._parse_annotation_response(raw)
+        assert len(result) == 1
+        assert result[0]["likely_name"] == "decrypt_config"
+
+    def test_markdown_fenced_json(self):
+        raw = '```json\n[{"name":"FUN_003","likely_name":"main_loop","purpose":"Event loop.","confidence":"low","evidence":[]}]\n```'
+        result = tasks._parse_annotation_response(raw)
+        assert len(result) == 1
+        assert result[0]["likely_name"] == "main_loop"
+
+    def test_missing_required_keys_filtered(self):
+        raw = json.dumps([
+            {"name": "FUN_004", "likely_name": "ok", "purpose": "test", "confidence": "high"},
+            {"name": "FUN_005"},  # missing required keys
+        ])
+        result = tasks._parse_annotation_response(raw)
+        assert len(result) == 1
+
+    def test_invalid_json_returns_empty(self):
+        result = tasks._parse_annotation_response("not valid json at all")
+        assert result == []
+
+    def test_invalid_confidence_corrected_to_low(self):
+        raw = json.dumps([
+            {
+                "name": "FUN_006",
+                "likely_name": "something",
+                "purpose": "does stuff",
+                "confidence": "very_high",
+                "evidence": [],
+            }
+        ])
+        result = tasks._parse_annotation_response(raw)
+        assert len(result) == 1
+        assert result[0]["confidence"] == "low"
+
+    def test_non_list_evidence_becomes_empty(self):
+        raw = json.dumps([
+            {
+                "name": "FUN_007",
+                "likely_name": "test_fn",
+                "purpose": "testing",
+                "confidence": "medium",
+                "evidence": "not a list",
+            }
+        ])
+        result = tasks._parse_annotation_response(raw)
+        assert len(result) == 1
+        assert result[0]["evidence"] == []
+
+
+# ---------------------------------------------------------------------------
+# _validate_llm_json
+# ---------------------------------------------------------------------------
+
+
+class TestValidateLLMJson:
+    """Validate LLM summary JSON parsing and validation."""
+
+    def test_valid_json_object(self):
+        result = tasks._validate_llm_json('{"overview": "test", "confidence": "high"}')
+        assert result is not None
+        assert result["overview"] == "test"
+
+    def test_markdown_fenced_json(self):
+        raw = '```json\n{"overview": "fenced"}\n```'
+        result = tasks._validate_llm_json(raw)
+        assert result is not None
+        assert result["overview"] == "fenced"
+
+    def test_invalid_json_returns_none(self):
+        result = tasks._validate_llm_json("this is not json")
+        assert result is None
+
+    def test_non_object_returns_none(self):
+        result = tasks._validate_llm_json("[1, 2, 3]")
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _build_annotation_chunks
+# ---------------------------------------------------------------------------
+
+
+class TestBuildAnnotationChunks:
+    """Validate annotation chunk building for LLM input."""
+
+    @staticmethod
+    def _write_test_artifacts(tmp_path):
+        summary_path = tmp_path / "summary.json"
+        summary_path.write_text(json.dumps({
+            "program_name": "test.exe",
+            "language_id": "x86:LE:64:default",
+            "imports": [{"library": "ws2_32.dll", "symbol": "connect"}],
+        }), encoding="utf-8")
+
+        functions_path = tmp_path / "functions.jsonl"
+        funcs = [
+            {
+                "name": "FUN_001", "entry_point": "0x001", "size": 200,
+                "callers": ["entry"], "callees": ["connect"],
+                "imported_calls": ["ws2_32.dll::connect"],
+                "string_refs": ["http://evil.com"],
+            },
+            {
+                "name": "FUN_002", "entry_point": "0x002", "size": 50,
+                "callers": [], "callees": [],
+                "imported_calls": [], "string_refs": [],
+            },
+        ]
+        functions_path.write_text(
+            "\n".join(json.dumps(f) for f in funcs) + "\n", encoding="utf-8"
+        )
+
+        decompile_path = tmp_path / "decompile.jsonl"
+        decs = [
+            {
+                "name": "FUN_001", "entry_point": "0x001", "status": "ok",
+                "decompile": "void FUN_001() { connect(s, addr, len); }",
+            },
+            {
+                "name": "FUN_002", "entry_point": "0x002", "status": "ok",
+                "decompile": "int FUN_002() { return 0; }",
+            },
+        ]
+        decompile_path.write_text(
+            "\n".join(json.dumps(d) for d in decs) + "\n", encoding="utf-8"
+        )
+
+        return str(summary_path), str(functions_path), str(decompile_path)
+
+    def test_chunks_include_binary_context(self, tmp_path):
+        summary, functions, decompile = self._write_test_artifacts(tmp_path)
+        chunks = tasks._build_annotation_chunks(functions, decompile, summary)
+        assert len(chunks) >= 1
+        assert "binary_context" in chunks[0]
+        assert chunks[0]["binary_context"]["program_name"] == "test.exe"
+
+    def test_chunks_include_enriched_functions(self, tmp_path):
+        summary, functions, decompile = self._write_test_artifacts(tmp_path)
+        chunks = tasks._build_annotation_chunks(functions, decompile, summary)
+        all_funcs = [f for chunk in chunks for f in chunk["functions"]]
+        assert len(all_funcs) == 2
+        # FUN_001 should come first (higher score)
+        assert all_funcs[0]["name"] == "FUN_001"
+        assert "decompile" in all_funcs[0]
+        assert "imported_calls" in all_funcs[0]
+        assert "string_refs" in all_funcs[0]
+
+    def test_chunking_respects_max_per_chunk(self, tmp_path):
+        summary, functions, decompile = self._write_test_artifacts(tmp_path)
+        chunks = tasks._build_annotation_chunks(
+            functions, decompile, summary, max_functions_per_chunk=1
+        )
+        assert len(chunks) == 2
+        assert len(chunks[0]["functions"]) == 1
+        assert len(chunks[1]["functions"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Focused mode parsing
+# ---------------------------------------------------------------------------
+
+
+class TestFocusedMode:
+    """Validate focused decompile mode configuration."""
+
+    def test_focused_mode_accepted(self):
+        config = tasks._parse_analysis_config({"decompile_mode": "focused"})
+        assert config.decompile_mode == "focused"
+        assert config.focused_decompile_limit == 80
+
+    def test_focused_decompile_limit_custom(self):
+        config = tasks._parse_analysis_config({
+            "decompile_mode": "focused",
+            "focused_decompile_limit": "120",
+        })
+        assert config.focused_decompile_limit == 120
+
+    def test_focused_decompile_limit_bounds(self):
+        with pytest.raises(RuntimeError, match="range"):
+            tasks._parse_analysis_config({
+                "decompile_mode": "focused",
+                "focused_decompile_limit": "5",
+            })
+
+    def test_focused_mode_in_headless_command(self, tmp_path):
+        config = tasks.AnalysisConfig(
+            timeout_seconds=600,
+            decompile_mode="focused",
+            export_format="json+decompile",
+            include_decompile=True,
+            keep_project=False,
+            analyze_headless_bin="/opt/ghidra/support/analyzeHeadless",
+            script_path="/opt/ghidra_scripts",
+            max_memory="4G",
+            ghidra_version="11.2.1",
+            scripts_git_sha="deadbeef",
+            active_processors=2,
+            focused_decompile_limit=80,
+            llm_config=None,
+        )
+
+        command = tasks._build_headless_command(
+            config=config,
+            project_directory=tmp_path,
+            project_name="TestProj",
+            input_file_path="/work/input/sample.bin",
+            summary_path="/work/output/summary.json",
+            functions_path="/work/output/functions.jsonl",
+            strings_path="/work/output/strings.json",
+            decompile_path="/work/output/decompile.jsonl",
+        )
+
+        # Verify focused:80 is passed to Ghidra script
+        assert "focused:80" in command
+        assert "ExportDecompileJsonl.java" in command
